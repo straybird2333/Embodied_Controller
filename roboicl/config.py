@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from roboicl.paths import CODE, ROBODOJO
@@ -115,6 +116,27 @@ def load_profile(path: Path | str) -> dict:
     return profile
 
 
+def registered_profile_paths(extra_dir: Path | str | None = None) -> tuple[Path, ...]:
+    """Return repository profiles plus optional administrator-installed profiles.
+
+    Extra profiles are limited to direct JSON children of a configured
+    directory. Resolving before the containment check prevents symlinks from
+    turning this allowlist into arbitrary file access.
+    """
+    paths = list(sorted((CODE / "configs/protocols").glob("*.json")))
+    directory = extra_dir or os.environ.get("ROBOICL_PROFILE_DIR")
+    if directory:
+        root = Path(directory).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError("configured profile directory is unavailable")
+        for candidate in sorted(root.glob("*.json")):
+            resolved = candidate.resolve()
+            if resolved.parent == root and resolved.is_file():
+                paths.append(resolved)
+    unique = {str(path.resolve()): path.resolve() for path in paths}
+    return tuple(unique[key] for key in sorted(unique))
+
+
 def task_source(task: str, variant: str) -> Path:
     if variant not in ("standard", "random"):
         raise ValueError("variant must be standard or random")
@@ -172,3 +194,37 @@ def render_official_task_prompt(task_config: dict) -> tuple[str, str, str]:
         sections.append(f"OFFICIAL COMMENT:\n{document['comment'].strip()}")
     sections.append("OFFICIAL SCORING:\n" + "\n".join(score_lines))
     return document["version"], document["source"], "\n\n".join(sections)
+
+
+def build_harness_config(task: str, profile: dict, variant: str = "standard",
+                         action_horizon: int | None = None) -> dict:
+    """Build the policy config from registered task/profile data.
+
+    Shared by the simulator runner and remote policy worker so both sides use
+    the same action horizon, constraints, task prompt, and reference aliases.
+    """
+    if variant not in ("standard", "random"):
+        raise ValueError("variant must be standard or random")
+    task_config = load_task(task)
+    config = json.loads((CODE / "configs/shared_harness.json").read_text(encoding="utf-8"))
+    config.update(profile.get("harness_overrides", {}))
+    config.update(task_config.get("harness_overrides", {}))
+    horizons = profile.get("task_horizons")
+    if not isinstance(horizons, dict) or task not in horizons:
+        raise ValueError(f"Task-adaptive horizon profile has no entry for {task}")
+    config.update(predict_horizon=horizons[task], execute_horizon=horizons[task])
+    version, source, prompt = render_official_task_prompt(task_config)
+    config["official_task_documentation_version"] = version
+    config["official_task_documentation_source"] = source
+    config["official_task_prompt"] = prompt
+    aliases = task_config.get("reference_instruction_aliases", {}).get(variant, [])
+    if (not isinstance(aliases, list)
+            or any(not isinstance(value, str) or not value for value in aliases)
+            or len(set(aliases)) != len(aliases)):
+        raise ValueError("reference_instruction_aliases must map variants to unique nonempty strings")
+    config["reference_instruction_aliases"] = aliases
+    if action_horizon is not None:
+        config.update(predict_horizon=action_horizon, execute_horizon=action_horizon)
+    if type(config.get("predict_horizon")) is not int or not 1 <= config["predict_horizon"] <= 64:
+        raise ValueError("action horizon must be 1..64")
+    return config

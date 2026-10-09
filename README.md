@@ -219,6 +219,13 @@ for a one-shot task without a published reference path. A process exit code of
 zero means evaluation completed; task success and progress are reported by the
 native RoboDojo evaluator in the generated `result.json`.
 
+### Remote policy transport
+
+The runner supports connecting a local simulator to a remote policy over a
+TLS-protected WebSocket. The repository also includes an authenticated control
+API, one-time policy sessions, and a WSS gateway. See
+[REMOTE_SIMULATION.md](REMOTE_SIMULATION.md) for the API workflow and
+`docs/remote-simulation-ops.md` for deployment.
 
 
 ## Repository layout

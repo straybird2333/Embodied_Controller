@@ -1,0 +1,21 @@
+[Unit]
+Description=RoboICL authenticated remote policy WebSocket gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lfy
+Group=lfy
+WorkingDirectory=/data1/lfy/Robbot
+EnvironmentFile=/etc/roboicl/policy-gateway.env
+ExecStart=/home/lfy/.conda/envs/roboicl-policy/bin/python -m roboicl.policy_gateway
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStopSec=35
+
+[Install]
+WantedBy=multi-user.target

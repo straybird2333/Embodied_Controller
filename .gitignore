@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 data/
 results/
+.roboicl-api/
+.roboicl-policy-gateway/
 eval_result/
 *.log
 .env

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 CODE = Path(__file__).absolute().parents[1]
@@ -23,11 +24,11 @@ if str(CODE) not in sys.path:
     sys.path.insert(0, str(CODE))
 
 from roboicl.config import (
+    build_harness_config,
     layout_path as configured_layout_path,
     load_profile,
     load_task,
     reference_path as configured_reference_path,
-    render_official_task_prompt,
     task_name,
     task_source,
 )
@@ -37,6 +38,7 @@ from roboicl.policy.image_budget import (
 from roboicl.policy.provider_compat import validate_api_mode, validate_endpoint
 from roboicl.paths import data_root as get_data_root, results_root as get_results_root, python_paths
 from roboicl.policy.train_reference_bundle import portable_bundle_digest
+from roboicl.remote_policy import SESSION_TOKEN_ENV, validate_policy_url
 from roboicl.upstream import verify_submodules
 
 
@@ -294,26 +296,7 @@ def check(task, shots, seed, layout, variant, action_horizon=None, *,
         sim_python,
         policy_python,
     ]
-    config = json.loads((CODE / "configs/shared_harness.json").read_text())
-    config.update(profile.get("harness_overrides", {}))
-    # Task contracts refine the shared/protocol defaults (for example action
-    # bounds or a legacy reference's optional result-camera payload).  Keeping
-    # this last makes those task-specific constraints authoritative without
-    # duplicating the common harness in every task file.
-    config.update(c.get("harness_overrides", {}))
-    config.update(predict_horizon=task_horizons[task], execute_horizon=task_horizons[task])
-    document_version, document_source, document_prompt = render_official_task_prompt(c)
-    config["official_task_documentation_version"] = document_version
-    config["official_task_documentation_source"] = document_source
-    config["official_task_prompt"] = document_prompt
-    aliases = c.get("reference_instruction_aliases", {}).get(variant, [])
-    if (not isinstance(aliases, list)
-            or any(not isinstance(value, str) or not value for value in aliases)
-            or len(set(aliases)) != len(aliases)):
-        raise ValueError("reference_instruction_aliases must map variants to unique nonempty strings")
-    config["reference_instruction_aliases"] = aliases
-    if action_horizon is not None:
-        config.update(predict_horizon=action_horizon, execute_horizon=action_horizon)
+    config = build_harness_config(task, profile, variant, action_horizon)
     horizon = config["predict_horizon"]
     if not 1 <= horizon <= 64:
         raise ValueError("action horizon must be 1..64")
@@ -401,6 +384,16 @@ def main():
     ap.add_argument("--conda-exe", default=os.environ.get("ROBOICL_CONDA_EXE"),
                     help="Optional conda executable for activating each interpreter's environment")
     ap.add_argument("--port", type=int)
+    ap.add_argument("--run-id", help=argparse.SUPPRESS)
+    ap.add_argument(
+        "--policy-url",
+        help="Use a remote policy WebSocket (wss://); ticket is read from ROBOICL_POLICY_SESSION_TOKEN",
+    )
+    ap.add_argument(
+        "--allow-insecure-policy-loopback",
+        action="store_true",
+        help="Allow ws:// only for a loopback policy URL during development",
+    )
     ap.add_argument("--action-horizon", type=int, default=None, help="Override both prediction and execution steps; few-shot needs matching reference")
     ap.add_argument("--reasoning-effort", choices=["low", "medium", "high", "xhigh", "max"], default=None)
     output_group = ap.add_mutually_exclusive_group()
@@ -413,6 +406,26 @@ def main():
         help="Render diagnostic only; no policy API or robot actions",
     )
     args = ap.parse_args()
+
+    if args.run_id is not None and (
+        not args.run_id or len(args.run_id) > 80
+        or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in args.run_id)
+    ):
+        ap.error("run id may contain only ASCII letters, digits, '_' and '-' (max 80 chars)")
+
+    if args.policy_url:
+        try:
+            args.policy_url = validate_policy_url(
+                args.policy_url,
+                allow_insecure_loopback=args.allow_insecure_policy_loopback,
+            )
+        except ValueError as exc:
+            ap.error(str(exc))
+        token = os.environ.get(SESSION_TOKEN_ENV)
+        if not token or not 16 <= len(token) <= 4096:
+            ap.error(f"remote policy mode requires {SESSION_TOKEN_ENV} (16..4096 characters)")
+    elif args.allow_insecure_policy_loopback:
+        ap.error("--allow-insecure-policy-loopback requires --policy-url")
 
     if min(args.seed, args.layout, args.gpu) < 0:
         ap.error("seed/layout/gpu must be nonnegative")
@@ -455,18 +468,29 @@ def main():
     output_tag = "out" + str(config.get("max_output_tokens") or "default")
     task_doc_tag = f"taskdoc-{config.get('official_task_documentation_version', 'none')}"
 
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", args.port or 0))
-        port = s.getsockname()[1]
+    if args.policy_url:
+        port = args.port or urlsplit(args.policy_url).port or (
+            443 if args.policy_url.startswith("wss:") else 80
+        )
+    else:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", args.port or 0))
+            port = s.getsockname()[1]
 
-    runid = (
+    runid = args.run_id or (
         datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         + f"_{args.task}_{args.shots}shot_s{args.seed}_{args.variant}_l{args.layout}_reasoning-{effort}_{output_tag}_{horizon_tag}_{live_anchor_tag}_{task_doc_tag}"
     )
     out = results_root / runid
 
     env = os.environ.copy()
-    if profile.get("endpoint") is not None:
+    if args.policy_url:
+        # The simulator only needs the short-lived policy ticket. Model-provider
+        # credentials stay on the remote policy host and are not inherited.
+        env.pop("ASTRA_API_KEY", None)
+        env.pop("ASTRA_API_KEY_FILE", None)
+        env.pop("ASTRA_ENDPOINT", None)
+    if profile.get("endpoint") is not None and not args.policy_url:
         # A selected profile is authoritative. In particular, do not inherit a
         # /v1/responses endpoint from a shell credential file for a Chat model.
         env["ASTRA_ENDPOINT"] = profile["endpoint"]
@@ -544,6 +568,10 @@ def main():
         "--kit_args",
         "--enable isaacsim.replicator.behavior --enable isaacsim.sensors.camera",
     ]
+    if args.policy_url:
+        client.extend(["--policy-url", args.policy_url])
+        if args.allow_insecure_policy_loopback:
+            client.append("--allow-insecure-policy-loopback")
     if args.capture_only:
         client.append("--capture-only")
         server = []
@@ -554,8 +582,9 @@ def main():
         "layout_sha256": sha(layout_path),
         "harness": config,
         "demo_manifest": env.get("ASTRA_DEMO_MANIFEST"),
-        "server_command": server,
+        "server_command": None if args.policy_url else server,
         "client_command": client,
+        "policy_transport": "remote-wss" if args.policy_url else "local-ws",
         "output": str(out),
         "data_root": str(data_root),
         "results_root": str(results_root),
@@ -575,6 +604,9 @@ def main():
         "asset_preflight": asset_report,
     }
     if args.dry_run:
+        if args.policy_url:
+            record["server_command"] = None
+            record["policy_transport"] = "remote-wss"
         record["upstream"] = verify_submodules()
         print(json.dumps(record, ensure_ascii=False, indent=2))
         return 0
@@ -586,7 +618,7 @@ def main():
             ASTRA_CAMERA_PREFLIGHT=str(out / "capture"),
         )
 
-    if not args.capture_only:
+    if not args.capture_only and not args.policy_url:
         for k in ["ASTRA_API_KEY", "ASTRA_ENDPOINT"]:
             if not env.get(k):
                 raise ValueError(f"Supply {k} externally")
@@ -643,7 +675,7 @@ def main():
     print(f"Run: {out}", flush=True)
 
     try:
-        if not args.capture_only:
+        if not args.capture_only and not args.policy_url:
             with (out / "server.log").open("w") as log:
                 p = subprocess.Popen(
                     wrapped(policy_python, server),

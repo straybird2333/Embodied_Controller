@@ -1,0 +1,203 @@
+openapi: 3.1.0
+info:
+  title: RoboICL Remote Simulation API
+  version: 1.0.0
+  description: >-
+    Authenticated control API for queued RoboDojo rollouts. All routes require
+    HTTPS at the deployment reverse proxy and a RoboICL access key.
+servers:
+  - url: https://roboicl.example.invalid
+security:
+  - BearerAccessKey: []
+paths:
+  /v1/health:
+    get:
+      operationId: getHealth
+      responses:
+        '200':
+          description: Readiness; contains no secrets or host paths.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_version: { type: string }
+                  ready: { type: boolean }
+                  assets_ready: { type: boolean }
+                  simulator_python_ready: { type: boolean }
+                  policy_gateway_ready: { type: boolean }
+                  available_gpu_slots: { type: integer, minimum: 0 }
+                  available_gpus:
+                    type: array
+                    items: { type: integer, minimum: 0 }
+                  configured_gpus:
+                    type: array
+                    items: { type: integer, minimum: 0 }
+                  max_parallel_runs: { type: integer, minimum: 1 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/policy-sessions:
+    post:
+      operationId: createPolicySession
+      description: >-
+        Creates a short lived, single run session scope. The returned ID is an
+        opaque registry identifier. The external policy client connects to
+        the returned WSS URL using its one-time, session-scoped bearer token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [task, shots, profile]
+              properties:
+                task: { type: string, pattern: '^[A-Za-z0-9_-]{1,80}$' }
+                shots: { type: integer, enum: [0, 1] }
+                seed: { type: integer, minimum: 0, maximum: 1000000, default: 0 }
+                layout: { type: integer, minimum: 0, maximum: 1000000, default: 0 }
+                profile: { type: string, description: Registered protocol profile id }
+                reasoning_effort: { type: string, enum: [low, medium, high, xhigh, max] }
+                ttl_seconds: { type: integer, minimum: 60, maximum: 1800, default: 900 }
+      responses:
+        '201':
+          description: One run session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicySession' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { description: Request body exceeds 16 KiB }
+        '422': { description: Unregistered task/profile or invalid parameter }
+        '503': { description: Assets or policy gateway are not ready }
+  /v1/runs:
+    post:
+      operationId: createRun
+      description: >-
+        policy_session is the opaque ID returned by POST /v1/policy-sessions.
+        It is bound to the same task settings and can be used once. The
+        external policy client connects to the returned external_policy_ws_url
+        using its short-lived external_policy_token; the simulator's separate
+        ticket is generated internally and never returned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [task, shots, profile, policy_session]
+              properties:
+                task: { type: string, pattern: '^[A-Za-z0-9_-]{1,80}$' }
+                shots: { type: integer, enum: [0, 1] }
+                seed: { type: integer, minimum: 0, maximum: 1000000, default: 0 }
+                layout: { type: integer, minimum: 0, maximum: 1000000, default: 0 }
+                profile: { type: string, description: Registered protocol id }
+                reasoning_effort: { type: string, enum: [low, medium, high, xhigh, max] }
+                policy_session:
+                  type: string
+                  pattern: '^[0-9a-f]{32}$'
+      responses:
+        '202':
+          description: Run accepted into the bounded queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { description: Request body exceeds 16 KiB }
+        '422': { description: Unregistered task/profile or invalid parameter }
+        '429': { description: Queue full or caller rate limited }
+        '503': { description: Assets or policy gateway are not ready }
+  /v1/runs/{run_id}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      operationId: getRun
+      responses:
+        '200':
+          description: Current run state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Run not found }
+  /v1/runs/{run_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      operationId: cancelRun
+      responses:
+        '202': { description: Cancellation accepted or already requested }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Run not found }
+  /v1/runs/{run_id}/result:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      operationId: getRunResult
+      responses:
+        '200':
+          description: Whitelisted evaluator summary with no file paths.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, status, result]
+                properties:
+                  run_id: { type: string }
+                  status: { type: string }
+                  result: { $ref: '#/components/schemas/Result' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Run not found }
+        '409': { description: Result is not ready }
+components:
+  securitySchemes:
+    BearerAccessKey:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  parameters:
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[0-9a-f]{32}$' }
+  responses:
+    Unauthorized:
+      description: Missing or invalid access key.
+  schemas:
+    PolicySession:
+      type: object
+      required: [policy_session, external_policy_ws_url, external_policy_token, expires_at]
+      properties:
+        policy_session: { type: string, pattern: '^[0-9a-f]{32}$' }
+        external_policy_ws_url: { type: string, format: uri, description: Public WSS URL for the external policy client }
+        external_policy_token: { type: string, readOnly: true, description: One-time session-scoped bearer token; keep secret }
+        expires_at: { type: string, format: date-time }
+    Run:
+      type: object
+      properties:
+        run_id: { type: string }
+        task: { type: string }
+        shots: { type: integer }
+        seed: { type: integer }
+        layout: { type: integer }
+        profile: { type: string }
+        status: { type: string, enum: [queued, starting, running, cancelling, succeeded, failed, cancelled] }
+        stage: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        completed_steps: { type: [integer, 'null'] }
+        returncode: { type: [integer, 'null'] }
+        gpu: { type: [integer, 'null'], description: Assigned GPU index }
+        error_code: { type: [string, 'null'] }
+        error_summary: { type: [string, 'null'] }
+        status_url: { type: string }
+        cancel_url: { type: string }
+    Result:
+      type: object
+      properties:
+        success_rate: { type: number }
+        eval_time: { type: integer }
+        score: { type: number }
+        details: { type: object, additionalProperties: true }

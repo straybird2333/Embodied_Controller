@@ -11,6 +11,7 @@ import traceback
 import types
 
 from roboicl.paths import ROBODOJO, configure_imports
+from roboicl.remote_policy import install_session_auth, validate_policy_url
 
 configure_imports("sim")
 
@@ -24,8 +25,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--layout", required=True, type=int)
     value.add_argument("--data-root", required=True, type=Path)
     value.add_argument("--results-root", required=True, type=Path)
-    value.add_argument("--port", required=True, type=int)
+    value.add_argument("--port", type=int)
     value.add_argument("--host", default="127.0.0.1")
+    value.add_argument("--policy-url")
+    value.add_argument("--allow-insecure-policy-loopback", action="store_true")
     value.add_argument("--capture-only", action="store_true")
     AppLauncher.add_app_launcher_args(value)
     return value
@@ -46,6 +49,22 @@ class _OfflineClient:
 
 def main() -> int:
     args = parser().parse_args()
+    if args.policy_url:
+        args.policy_url = validate_policy_url(
+            args.policy_url,
+            allow_insecure_loopback=args.allow_insecure_policy_loopback,
+        )
+        install_session_auth(args.policy_url)
+        from urllib.parse import urlsplit
+        parsed_policy_url = urlsplit(args.policy_url)
+        args.host = parsed_policy_url.hostname
+        args.port = args.port or parsed_policy_url.port or (
+            443 if parsed_policy_url.scheme == "wss" else 80
+        )
+    elif args.allow_insecure_policy_loopback:
+        raise ValueError("--allow-insecure-policy-loopback requires --policy-url")
+    if args.port is None:
+        raise ValueError("--port is required unless --policy-url is set")
     data_root = args.data_root.expanduser().resolve()
     results_root = args.results_root.expanduser().resolve()
     assets = data_root / "Assets"
@@ -81,6 +100,22 @@ def main() -> int:
             # can replace env.model_client. Inject the no-op client at that one
             # owned boundary so capture-only never waits for a policy server.
             eval_env_module.WsModelClient = _OfflineClient
+        elif args.policy_url:
+            # The gateway starts the policy worker after accepting the
+            # authenticated WebSocket handshake. Bound retries so a failed
+            # session does not leave the simulator looping for 15 minutes.
+            upstream_client = eval_env_module.WsModelClient
+
+            class _RemoteSessionClient(upstream_client):
+                def __init__(self, *client_args, **client_kwargs):
+                    client_kwargs.setdefault("connect_timeout_s", 10.0)
+                    client_kwargs.setdefault("handshake_timeout_s", 300.0)
+                    client_kwargs.setdefault("max_connect_attempts", 3)
+                    client_kwargs.setdefault("connect_retry_delay_s", 2.0)
+                    client_kwargs.setdefault("max_connect_seconds", 30.0)
+                    super().__init__(*client_args, **client_kwargs)
+
+            eval_env_module.WsModelClient = _RemoteSessionClient
         create_eval_env = eval_env_module.create_eval_env
         from utils.load_file import load_yaml
         from utils.pipeline_utils import process_config, process_randomization
@@ -106,7 +141,7 @@ def main() -> int:
             "port": args.port,
             "host": args.host,
             "protocol": "ws",
-            "policy_server_url": f"ws://{args.host}:{args.port}",
+            "policy_server_url": args.policy_url or f"ws://{args.host}:{args.port}",
             "evaluation_id": os.environ["ROBODOJO_RUN_ID"],
             "trial_id": f"{args.task}-{os.environ['ROBODOJO_RUN_ID']}",
             "action_case_id": f"{args.task}_case",
