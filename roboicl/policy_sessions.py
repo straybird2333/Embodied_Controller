@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import time
 
+from roboicl.transport import TRANSPORT_DEFAULTS, transport_options
+
 
 def load_ticket_secret() -> bytes:
     raw = os.environ.get("ROBOICL_POLICY_TICKET_SECRET")
@@ -70,7 +72,11 @@ def verify_ticket(secret: bytes, token: str, *, now: int | None = None) -> dict:
     # Continue accepting the pre-role simulator ticket shape during a rolling
     # restart. New tickets always include an explicit role.
     legacy_simulator = common - {"role"} | {"run_id"}
-    if set(claims) != required and not (role == "simulator" and set(claims) == legacy_simulator):
+    option_keys = set(claims) & set(TRANSPORT_DEFAULTS)
+    if option_keys and option_keys != set(TRANSPORT_DEFAULTS):
+        raise ValueError("incomplete transport ticket scope")
+    bare_keys = set(claims) - option_keys
+    if bare_keys != required and not (role == "simulator" and bare_keys == legacy_simulator):
         raise ValueError("invalid ticket claims")
     if role not in {"simulator", "external_policy"}:
         raise ValueError("invalid ticket role")
@@ -90,4 +96,7 @@ def verify_ticket(secret: bytes, token: str, *, now: int | None = None) -> dict:
             or claims.get("reasoning_effort") is not None
                and claims.get("reasoning_effort") not in {"low", "medium", "high", "xhigh", "max"}):
         raise ValueError("invalid ticket scope")
+    selected = transport_options(claims)
+    if option_keys and any(claims[key] != selected[key] for key in option_keys):
+        raise ValueError("noncanonical transport ticket scope")
     return claims

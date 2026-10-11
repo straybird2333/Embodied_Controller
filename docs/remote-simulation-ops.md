@@ -87,6 +87,20 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/roboicl.example.net/privkey.pem;
     client_max_body_size 16k;
 
+    location /v1/transfer-test/ {
+        client_max_body_size 64m;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Authorization $http_authorization;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+    }
+
     location /v1/ {
         limit_req zone=roboicl_api burst=10 nodelay;
         proxy_pass http://127.0.0.1:8080;
@@ -146,8 +160,10 @@ curl --fail-with-body --silent --show-error \
 Use its returned `policy_session` value in `POST /v1/runs`; the ID is not a
 secret. The server separately issues the simulator's signed WSS ticket. Poll the returned
 `status_url`, cancel through `cancel_url`, and read the whitelisted result from
-`/v1/runs/{run_id}/result`. The API has no file or log download route. See
-`docs/remote-simulation-openapi.yaml` for the full contract.
+`/v1/runs/{run_id}/result`. Run logs/artifacts have no public download route;
+the separate transfer-test endpoint serves only its fixed benchmark archive.
+See `docs/remote-simulation-openapi.yaml` for the full API contract and
+`docs/transfer-speed-test.md` for its upload/download timing commands.
 
 The API stores its SQLite registry and bounded private logs in the configured
 state directory. Results are written by the existing runner and removed after

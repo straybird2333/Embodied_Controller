@@ -35,6 +35,110 @@ paths:
                     items: { type: integer, minimum: 0 }
                   max_parallel_runs: { type: integer, minimum: 1 }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/diagnostics/capabilities:
+    get:
+      operationId: getDiagnosticsCapabilities
+      description: Returns cached implementation/version/limit metadata without touching simulator assets or GPUs.
+      responses:
+        '200':
+          description: Diagnostic API capabilities and measurement caveats.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiagnosticCapabilities' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/transfer-test/info:
+    get:
+      operationId: getTransferTestInfo
+      description: Metadata for the fixed 10-copy camera-image benchmark archive.
+      responses:
+        '200':
+          description: Benchmark file size and transfer routes.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  format: { type: string }
+                  copies: { type: integer }
+                  file_count: { type: integer }
+                  bytes: { type: integer }
+                  sha256: { type: string }
+                  download_url: { type: string }
+                  upload_url: { type: string }
+                  upload_limit_bytes: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { description: Benchmark data is not installed }
+  /v1/transfer-test/download:
+    get:
+      operationId: downloadTransferTestFile
+      description: Streams the fixed uncompressed tar benchmark and records server send time.
+      responses:
+        '200':
+          description: Benchmark archive; X-Transfer-Test-Id identifies the timing record.
+          headers:
+            X-Transfer-Test-Id: { schema: { type: string } }
+            X-Transfer-Test-Bytes: { schema: { type: integer } }
+          content:
+            application/x-tar:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { description: Transfer test rate limit exceeded }
+        '503': { description: Benchmark data is not installed }
+  /v1/transfer-test/upload:
+    post:
+      operationId: uploadTransferTestFile
+      description: >-
+        Streams up to 64 MiB of octet-stream data without persisting the body.
+        Records bytes, receive time, SHA-256, and whether the body matches the
+        benchmark download. Client-side curl timing measures the full public path.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary, maxLength: 67108864 }
+      responses:
+        '201':
+          description: Upload received and timing recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransferTestRecord' }
+        '400': { description: Invalid or incomplete upload }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { description: Upload exceeds 64 MiB }
+        '415': { description: Content-Type must be application/octet-stream }
+        '429': { description: Transfer test rate limit exceeded }
+  /v1/transfer-test/records:
+    get:
+      operationId: listTransferTestRecords
+      description: Returns the last 20 transfer records created with this API key.
+      responses:
+        '200':
+          description: Recent transfer records.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items: { $ref: '#/components/schemas/TransferTestRecord' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/transfer-test/records/{test_id}:
+    parameters:
+      - name: test_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[0-9a-f]{32}$' }
+    get:
+      operationId: getTransferTestRecord
+      responses:
+        '200':
+          description: Transfer timing record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransferTestRecord' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Record not found for this API key }
   /v1/policy-sessions:
     post:
       operationId: createPolicySession
@@ -58,6 +162,10 @@ paths:
                 profile: { type: string, description: Registered protocol profile id }
                 reasoning_effort: { type: string, enum: [low, medium, high, xhigh, max] }
                 ttl_seconds: { type: integer, minimum: 60, maximum: 1800, default: 900 }
+                action_format: { $ref: '#/components/schemas/ActionFormat' }
+                feedback_mode: { $ref: '#/components/schemas/FeedbackMode' }
+                observation_encoding: { $ref: '#/components/schemas/ObservationEncoding' }
+                jpeg_quality: { $ref: '#/components/schemas/JpegQuality' }
       responses:
         '201':
           description: One run session created.
@@ -77,6 +185,8 @@ paths:
         external policy client connects to the returned external_policy_ws_url
         using its short-lived external_policy_token; the simulator's separate
         ticket is generated internally and never returned.
+        Transport options inherit from the policy session when omitted;
+        supplied values must equal the negotiated session values.
       requestBody:
         required: true
         content:
@@ -95,6 +205,10 @@ paths:
                 policy_session:
                   type: string
                   pattern: '^[0-9a-f]{32}$'
+                action_format: { $ref: '#/components/schemas/ActionFormat' }
+                feedback_mode: { $ref: '#/components/schemas/FeedbackMode' }
+                observation_encoding: { $ref: '#/components/schemas/ObservationEncoding' }
+                jpeg_quality: { $ref: '#/components/schemas/JpegQuality' }
       responses:
         '202':
           description: Run accepted into the bounded queue.
@@ -119,6 +233,70 @@ paths:
               schema: { $ref: '#/components/schemas/Run' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: Run not found }
+  /v1/diagnostic-runs:
+    post:
+      operationId: createDiagnosticRun
+      description: >-
+        Queues a no-LLM first-observation or fixed-step diagnostic on the normal
+        GPU scheduler. No policy session or image/file upload is used.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DiagnosticRunRequest' }
+      responses:
+        '202':
+          description: Diagnostic run accepted into the bounded GPU queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiagnosticRun' }
+        '400': { description: Invalid JSON }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { description: Unsupported mode, task, profile, or settings }
+        '429': { description: Queue full or caller rate limited }
+        '503': { description: Required simulator assets are not ready }
+  /v1/runs/{run_id}/diagnostics:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      operationId: getRunDiagnostics
+      parameters:
+        - name: after_seq
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        '200':
+          description: Caller-owned run timeline page and cumulative timing summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunDiagnostics' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Run not found for this API key }
+        '400': { description: Invalid cursor or limit }
+  /v1/runs/{run_id}/logs:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      operationId: getRunLogTail
+      parameters:
+        - name: source
+          in: query
+          schema: { type: string, enum: [runner, client, camera], default: runner }
+        - name: tail_lines
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        '200':
+          description: Redacted and size-bounded tail of a fixed run log.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunLogTail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Run or selected log not found for this API key }
+        '400': { description: Invalid source or tail_lines }
   /v1/runs/{run_id}/cancel:
     parameters:
       - $ref: '#/components/parameters/RunId'
@@ -164,14 +342,49 @@ components:
     Unauthorized:
       description: Missing or invalid access key.
   schemas:
+    ActionFormat:
+      type: string
+      enum: [legacy, ee_targets_f32_v1]
+      description: Session default legacy; run inherits. Compact float32 H by 16 absolute EE targets in wxyz order.
+    FeedbackMode:
+      type: string
+      enum: [per_step, chunk_boundary]
+      description: Session default per_step; run inherits. Chunk mode keeps local per-step observation and control checks.
+    ObservationEncoding:
+      type: string
+      enum: [raw_rgb, jpeg]
+      description: Session default raw_rgb; run inherits. JPEG affects only outgoing color and uses the shared RGB encoder.
+    JpegQuality:
+      type: [integer, 'null']
+      minimum: 1
+      maximum: 100
+      description: JPEG defaults to 90; raw_rgb requires null or omitted.
+    PolicyTransportCapabilities:
+      type: object
+      required: [schema_version, action_formats, feedback_modes, observation_encodings, defaults, negotiation]
+      properties:
+        schema_version: { type: string, const: '1' }
+        action_formats: { type: array, items: { $ref: '#/components/schemas/ActionFormat' } }
+        feedback_modes: { type: array, items: { $ref: '#/components/schemas/FeedbackMode' } }
+        observation_encodings: { type: array, items: { $ref: '#/components/schemas/ObservationEncoding' } }
+        defaults: { type: object }
+        jpeg_quality: { type: object }
+        negotiation: { type: string }
+        compact_max_steps: { type: integer, const: 64 }
+        coordinate_semantics: { type: string }
     PolicySession:
       type: object
-      required: [policy_session, external_policy_ws_url, external_policy_token, expires_at]
+      required: [policy_session, external_policy_ws_url, external_policy_token, expires_at, action_format, feedback_mode, observation_encoding, jpeg_quality, transport_capabilities]
       properties:
         policy_session: { type: string, pattern: '^[0-9a-f]{32}$' }
         external_policy_ws_url: { type: string, format: uri, description: Public WSS URL for the external policy client }
         external_policy_token: { type: string, readOnly: true, description: One-time session-scoped bearer token; keep secret }
         expires_at: { type: string, format: date-time }
+        action_format: { $ref: '#/components/schemas/ActionFormat' }
+        feedback_mode: { $ref: '#/components/schemas/FeedbackMode' }
+        observation_encoding: { $ref: '#/components/schemas/ObservationEncoding' }
+        jpeg_quality: { $ref: '#/components/schemas/JpegQuality' }
+        transport_capabilities: { $ref: '#/components/schemas/PolicyTransportCapabilities' }
     Run:
       type: object
       properties:
@@ -181,6 +394,10 @@ components:
         seed: { type: integer }
         layout: { type: integer }
         profile: { type: string }
+        action_format: { $ref: '#/components/schemas/ActionFormat' }
+        feedback_mode: { $ref: '#/components/schemas/FeedbackMode' }
+        observation_encoding: { $ref: '#/components/schemas/ObservationEncoding' }
+        jpeg_quality: { $ref: '#/components/schemas/JpegQuality' }
         status: { type: string, enum: [queued, starting, running, cancelling, succeeded, failed, cancelled] }
         stage: { type: string }
         created_at: { type: string, format: date-time }
@@ -188,12 +405,99 @@ components:
         started_at: { type: [string, 'null'], format: date-time }
         finished_at: { type: [string, 'null'], format: date-time }
         completed_steps: { type: [integer, 'null'] }
+        diagnostic_mode: { type: [string, 'null'], enum: [first_observation, fixed_steps, null] }
+        diagnostic_phase: { type: [string, 'null'] }
+        first_observation_ready: { type: [boolean, 'null'] }
+        cleanup_complete: { type: [boolean, 'null'] }
+        diagnostic_success: { type: [boolean, 'null'] }
         returncode: { type: [integer, 'null'] }
         gpu: { type: [integer, 'null'], description: Assigned GPU index }
         error_code: { type: [string, 'null'] }
         error_summary: { type: [string, 'null'] }
+    TransferTestRecord:
+      type: object
+      required: [transfer_test_id, direction, bytes, server_elapsed_seconds, server_mib_per_second, status, recorded_at]
+      properties:
+        transfer_test_id: { type: string }
+        direction: { type: string, enum: [upload, download] }
+        bytes: { type: integer }
+        server_elapsed_seconds: { type: number }
+        server_mib_per_second: { type: number }
+        sha256: { type: [string, 'null'] }
+        status: { type: string, enum: [complete, incomplete, interrupted] }
+        recorded_at: { type: string, format: date-time }
+        matches_download_payload: { type: [boolean, 'null'] }
         status_url: { type: string }
         cancel_url: { type: string }
+    DiagnosticRunRequest:
+      type: object
+      additionalProperties: false
+      required: [task, shots, profile, mode]
+      properties:
+        task: { type: string, pattern: '^[A-Za-z0-9_-]{1,80}$' }
+        shots: { type: integer, enum: [0, 1] }
+        seed: { type: integer, minimum: 0, maximum: 1000000, default: 0 }
+        layout: { type: integer, minimum: 0, maximum: 1000000, default: 0 }
+        profile: { type: string }
+        reasoning_effort: { type: string, enum: [low, medium, high, xhigh, max] }
+        mode: { type: string, enum: [first_observation, fixed_steps] }
+        max_steps: { type: integer, minimum: 0, maximum: 20, default: 0 }
+        timeout_seconds: { type: integer, minimum: 60, maximum: 3600, default: 1800 }
+    DiagnosticRun:
+      allOf:
+        - $ref: '#/components/schemas/Run'
+        - type: object
+          properties:
+            diagnostic_mode: { type: string, enum: [first_observation, fixed_steps] }
+            diagnostic_success: { type: [boolean, 'null'] }
+            task_success: { type: 'null' }
+            diagnostics_url: { type: string }
+            logs_url: { type: string }
+    RunDiagnostics:
+      type: object
+      required: [schema_version, run_id, status, events, next_seq, has_more, summary]
+      properties:
+        schema_version: { type: string }
+        run_id: { type: string }
+        status: { type: string }
+        diagnostic_mode: { type: [string, 'null'] }
+        current_phase: { type: [string, 'null'] }
+        phase_started_at: { type: [string, 'null'], format: date-time }
+        phase_elapsed_seconds: { type: [number, 'null'] }
+        last_heartbeat_at: { type: [string, 'null'], format: date-time }
+        completed_steps: { type: integer, minimum: 0 }
+        first_observation_ready: { type: boolean }
+        cleanup_complete: { type: boolean }
+        diagnostic_success: { type: [boolean, 'null'] }
+        task_success: { type: 'null' }
+        events: { type: array, items: { type: object, additionalProperties: true } }
+        resource_samples: { type: array, items: { type: object, additionalProperties: true } }
+        next_seq: { type: integer, minimum: 1 }
+        has_more: { type: boolean }
+        summary: { type: object, additionalProperties: true }
+    RunLogTail:
+      type: object
+      required: [run_id, source, truncated, text]
+      properties:
+        run_id: { type: string }
+        source: { type: string, enum: [runner, client, camera] }
+        truncated: { type: boolean }
+        log_time: { type: [string, 'null'], format: date-time }
+        text: { type: string, maxLength: 262144 }
+    DiagnosticCapabilities:
+      type: object
+      required: [schema_version, diagnostic_schema_version, implemented_endpoints, diagnostic_modes, limits, resource_sampling]
+      properties:
+        policy_transport: { $ref: '#/components/schemas/PolicyTransportCapabilities' }
+      properties:
+        schema_version: { type: string }
+        code_commit: { type: [string, 'null'] }
+        working_tree_dirty: { type: [boolean, 'null'] }
+        diagnostic_schema_version: { type: string }
+        implemented_endpoints: { type: array, items: { type: string } }
+        diagnostic_modes: { type: object, additionalProperties: true }
+        limits: { type: object, additionalProperties: true }
+        resource_sampling: { type: object, additionalProperties: true }
     Result:
       type: object
       properties:

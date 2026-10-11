@@ -1,7 +1,20 @@
 # RoboICL 部署与使用交接
 
-更新时间：2026-10-02  
+更新时间：2026-10-12
+
 项目目录：`/data1/lfy/Robbot`
+
+最新性能修复：已将导致首次 PhysX 步等待的远程材质依赖缓存到本地，
+deposit_coin 两个布局的新进程首帧诊断为 54.21–73.34 秒，后续采集约 0.105 秒。
+新 API 任务自动使用缓存。部署、证据及查询命令见
+[首帧修复记录](docs/first-frame-material-cache-fix.md)。以下原部署/模型联调信息保留作为历史记录。
+
+## 公网流量精简协议（2026-10-12）
+
+会话已支持显式协商紧凑 float32 动作、chunk_boundary 反馈及服务端 RGB JPEG。
+旧客户端默认 legacy/per_step/raw_rgb，保持现有调用方式。
+另一机器需检查会话回显再开启新动作格式，并处理分组回执和 JPEG bytes。
+具体契约、示例和验证边界见 [docs/lean-policy-transport.md](docs/lean-policy-transport.md)。
 
 ## 部署状态
 

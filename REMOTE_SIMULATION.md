@@ -93,6 +93,17 @@ an administrator-installed JSON file directly under the simulator host's
 select the external client's LLM provider. Clients cannot submit arbitrary
 configuration files or commands.
 
+## Upload/download speed test
+
+The deployed API can stream a fixed uncompressed tar made from ten copies of
+each of the three saved 640×480 camera PNGs. Use
+`GET /v1/transfer-test/download` and upload the downloaded file to
+`POST /v1/transfer-test/upload`; both directions record bytes and server-side
+elapsed time. The upload body is streamed, hashed, and discarded rather than
+stored. `curl` client timing measures the complete public route. See
+[`docs/transfer-speed-test.md`](docs/transfer-speed-test.md) for commands and
+the records endpoints.
+
 The API and policy gateway default to loopback listeners. The reverse proxy
 routes `/session/{id}` for the simulator and `/external/{id}` for the external
 client. The external client initiates its WSS connection, so the simulator

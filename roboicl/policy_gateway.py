@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from roboicl.paths import CODE
+from roboicl.transport import transport_options
 from roboicl.policy_sessions import load_ticket_secret, verify_ticket
 
 
@@ -34,6 +35,7 @@ _EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 class _RelaySession:
     simulator: object | None = None
     external_policy: object | None = None
+    transport: dict | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -236,14 +238,21 @@ class PolicyGateway:
         duplicate = False
         with self.relay_guard:
             pair = self.relay_sessions.setdefault(sid, _RelaySession())
-            if getattr(pair, slot) is not None:
+            selected = transport_options(claims)
+            if getattr(pair, slot) is not None or (pair.transport is not None and pair.transport != selected):
                 duplicate = True
             else:
+                pair.transport = selected
                 setattr(pair, slot, client)
                 if pair.simulator is not None and pair.external_policy is not None:
                     pair.ready.set()
         if duplicate:
-            await client.close(code=1008, reason="duplicate session peer")
+            # A mismatched second role never enters the normal handler finally
+            # block. Release its admission slot without removing a live peer.
+            if getattr(pair, slot) is None:
+                with self.guard:
+                    (self.active_sids if role == "simulator" else self.active_external_sids).discard(sid)
+            await client.close(code=1008, reason="duplicate or mismatched session peer")
             return
         try:
             wait_seconds = max(1, min(self.worker_timeout, claims["exp"] - int(time.time())))

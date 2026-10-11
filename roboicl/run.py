@@ -40,6 +40,8 @@ from roboicl.paths import data_root as get_data_root, results_root as get_result
 from roboicl.policy.train_reference_bundle import portable_bundle_digest
 from roboicl.remote_policy import SESSION_TOKEN_ENV, validate_policy_url
 from roboicl.upstream import verify_submodules
+from roboicl.diagnostics import emit, span
+from roboicl.transport import transport_options
 
 
 def absolute_path(value):
@@ -324,11 +326,13 @@ def stop(p):
     if p is None or p.poll() is not None:
         return
 
-    for sig, timeout in [
-        (signal.SIGINT, 30),
-        (signal.SIGTERM, 10),
-        (signal.SIGKILL, 5),
-    ]:
+    # API supervisor escalates after 20 seconds. Reap our separate child
+    # sessions before that deadline, including when native code ignores TERM.
+    # The interactive CLI retains its longer graceful Isaac shutdown window.
+    signals = ([(signal.SIGTERM, 5), (signal.SIGKILL, 3)]
+               if os.environ.get("ROBOICL_API_RUN_ID") else
+               [(signal.SIGINT, 30), (signal.SIGTERM, 10), (signal.SIGKILL, 5)])
+    for sig, timeout in signals:
         try:
             os.killpg(p.pid, sig)
             p.wait(timeout=timeout)
@@ -405,6 +409,8 @@ def main():
         action="store_true",
         help="Render diagnostic only; no policy API or robot actions",
     )
+    ap.add_argument("--diagnostic-mode", choices=["first_observation", "fixed_steps"])
+    ap.add_argument("--max-steps", type=int, default=0)
     args = ap.parse_args()
 
     if args.run_id is not None and (
@@ -431,6 +437,15 @@ def main():
         ap.error("seed/layout/gpu must be nonnegative")
     if args.reference is not None and args.shots == 0:
         ap.error("--reference is only valid with --shots 1")
+    if args.diagnostic_mode:
+        if args.policy_url or args.capture_only:
+            ap.error("diagnostic mode cannot use a remote policy URL or capture-only mode")
+        if args.diagnostic_mode == "first_observation" and args.max_steps != 0:
+            ap.error("first_observation requires --max-steps 0")
+        if args.diagnostic_mode == "fixed_steps" and not 1 <= args.max_steps <= 20:
+            ap.error("fixed_steps requires --max-steps 1..20")
+    elif args.max_steps:
+        ap.error("--max-steps requires --diagnostic-mode")
 
     data_root = absolute_path(args.data_root)
     results_root = absolute_path(args.results_root)
@@ -440,19 +455,27 @@ def main():
     profile = load_profile(profile_path)
     args.model = args.model or os.environ.get("ASTRA_MODEL") or profile.get("model", "gpt-6-astra")
     api_mode = profile.get("api_mode", "responses")
-    if profile.get("launch_blocked_reason") and not (args.dry_run or args.capture_only):
+    if profile.get("launch_blocked_reason") and not (args.dry_run or args.capture_only or args.diagnostic_mode):
         raise RuntimeError(
             "Provider profile is launch-blocked: " + profile["launch_blocked_reason"])
     conda_exe = python_path(args.conda_exe) if args.conda_exe else None
 
     preflight_report = {}
-    c, task, config, ref, layout_path = check(
-        args.task, args.shots, args.seed, args.layout, args.variant, args.action_horizon,
-        data_root=data_root, sim_python=sim_python, policy_python=policy_python, profile=profile,
-        reference=args.reference,
-        preflight_report=preflight_report,
-    )
-    asset_report = asset_preflight(data_root, layout_path)
+    with span("runner_preflight", source="runner"):
+        with span("resource_check", source="runner"):
+            c, task, config, ref, layout_path = check(
+                args.task, args.shots, args.seed, args.layout, args.variant, args.action_horizon,
+                data_root=data_root, sim_python=sim_python, policy_python=policy_python, profile=profile,
+                reference=args.reference, preflight_report=preflight_report,
+            )
+        with span("asset_preflight", source="runner"):
+            asset_report = asset_preflight(data_root, layout_path)
+    emit("instant", "runner_preflight_summary", source="runner",
+         attributes={"reference_shots": preflight_report.get("shots"),
+                     "reference_source_count": len(preflight_report.get("source_files", [])),
+                     "asset_scope": asset_report.get("scope"),
+                     "asset_manifest_sha256": asset_report.get("manifest_sha256"),
+                     "asset_tree_sha256": asset_report.get("assets_tree_sha256")})
 
     if args.reasoning_effort is not None:
         config["reasoning_effort"] = args.reasoning_effort
@@ -490,6 +513,11 @@ def main():
         env.pop("ASTRA_API_KEY", None)
         env.pop("ASTRA_API_KEY_FILE", None)
         env.pop("ASTRA_ENDPOINT", None)
+    elif args.diagnostic_mode:
+        # A diagnostic run is strictly no-LLM, even if the API service itself
+        # inherited provider credentials from its environment.
+        for key in ("ASTRA_API_KEY", "ASTRA_API_KEY_FILE", "ASTRA_ENDPOINT"):
+            env.pop(key, None)
     if profile.get("endpoint") is not None and not args.policy_url:
         # A selected profile is authoritative. In particular, do not inherit a
         # /v1/responses endpoint from a shell credential file for a Chat model.
@@ -572,6 +600,9 @@ def main():
         client.extend(["--policy-url", args.policy_url])
         if args.allow_insecure_policy_loopback:
             client.append("--allow-insecure-policy-loopback")
+    if args.diagnostic_mode:
+        client.extend(["--diagnostic-mode", args.diagnostic_mode,
+                       "--max-steps", str(args.max_steps)])
     if args.capture_only:
         client.append("--capture-only")
         server = []
@@ -582,9 +613,13 @@ def main():
         "layout_sha256": sha(layout_path),
         "harness": config,
         "demo_manifest": env.get("ASTRA_DEMO_MANIFEST"),
-        "server_command": None if args.policy_url else server,
+        "server_command": None if args.policy_url or args.diagnostic_mode else server,
         "client_command": client,
-        "policy_transport": "remote-wss" if args.policy_url else "local-ws",
+        "policy_transport": ("remote-wss" if args.policy_url else
+                              "diagnostic-stub-loopback" if args.diagnostic_mode else "local-ws"),
+        "policy_transport_options": transport_options(json.loads(os.environ.get("ROBOICL_TRANSPORT_OPTIONS", "{}"))),
+        "diagnostic_mode": args.diagnostic_mode,
+        "diagnostic_max_steps": args.max_steps if args.diagnostic_mode else None,
         "output": str(out),
         "data_root": str(data_root),
         "results_root": str(results_root),
@@ -602,23 +637,28 @@ def main():
         "source_manifest_sha256": sha(CODE / "RELEASE_MANIFEST.json") if (CODE / "RELEASE_MANIFEST.json").is_file() else None,
         "reference_preflight": preflight_report,
         "asset_preflight": asset_report,
+        "remote_material_cache_manifest_sha256": (
+            sha(data_root / "remote-material-cache/manifest.json")
+            if (data_root / "remote-material-cache/manifest.json").is_file() else None),
     }
     if args.dry_run:
         if args.policy_url:
             record["server_command"] = None
             record["policy_transport"] = "remote-wss"
-        record["upstream"] = verify_submodules()
+        with span("submodule_check", source="runner"):
+            record["upstream"] = verify_submodules()
         print(json.dumps(record, ensure_ascii=False, indent=2))
         return 0
 
-    record["upstream"] = verify_submodules()
+    with span("submodule_check", source="runner"):
+        record["upstream"] = verify_submodules()
 
     if args.capture_only:
         env.update(
             ASTRA_CAMERA_PREFLIGHT=str(out / "capture"),
         )
 
-    if not args.capture_only and not args.policy_url:
+    if not args.capture_only and not args.policy_url and not args.diagnostic_mode:
         for k in ["ASTRA_API_KEY", "ASTRA_ENDPOINT"]:
             if not env.get(k):
                 raise ValueError(f"Supply {k} externally")
@@ -675,7 +715,7 @@ def main():
     print(f"Run: {out}", flush=True)
 
     try:
-        if not args.capture_only and not args.policy_url:
+        if not args.capture_only and not args.policy_url and not args.diagnostic_mode:
             with (out / "server.log").open("w") as log:
                 p = subprocess.Popen(
                     wrapped(policy_python, server),
@@ -702,6 +742,10 @@ def main():
                     time.sleep(1)
 
         with (out / "client.log").open("w") as log:
+            launch_span_id = os.urandom(16).hex()
+            launch_started = time.monotonic_ns()
+            emit("span_begin", "sim_process_launch", source="runner", span_id=launch_span_id,
+                 attributes={"python": str(sim_python)})
             q = subprocess.Popen(
                 wrapped(sim_python, client),
                 cwd=CODE,
@@ -710,6 +754,9 @@ def main():
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            emit("span_end", "sim_process_launch", source="runner", span_id=launch_span_id,
+                 attributes={"duration_seconds": (time.monotonic_ns() - launch_started) / 1e9,
+                             "outcome": "started", "pid": q.pid})
 
         while q.poll() is None:
             if p is not None and p.poll() is not None:
@@ -740,6 +787,8 @@ def main():
                 status = "capture_complete_no_api"
             else:
                 raise RuntimeError("Capture-only run did not produce camera probe")
+        elif rc == 0 and args.diagnostic_mode:
+            status = "diagnostic_complete"
         elif rc == 0:
             result_path = (
                 results_root
